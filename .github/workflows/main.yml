@@ -1,0 +1,63 @@
+name: GitHub Issue Tracker & Email Notifier
+
+on:
+  schedule:
+    # Trigger every 5 minutes
+    - cron: '*/5 * * * *'
+  # Allow manual execution via the GitHub Actions UI
+  workflow_dispatch:
+
+# Avoid concurrent runs colliding on git commit / state updates
+concurrency:
+  group: issue-tracker-cron
+  cancel-in-progress: false
+
+jobs:
+  track-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to commit and push seen_issues.json back to the repository
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history to safely rebase and push
+          fetch-depth: 0
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: true
+
+      - name: Run Tracker Script
+        env:
+          # Default token provides higher rate limits for GitHub Search API
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # User-configured Gmail SMTP credentials
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          TARGET_ORGS: ${{ secrets.TARGET_ORGS }}
+        run: |
+          pixi run start
+
+      - name: Commit and Push Updated State
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Stage the deduplication state file
+          git add seen_issues.json
+          
+          # Check if there are changes to commit
+          if ! git diff --staged --quiet; then
+            echo "New issues recorded. Committing updated state..."
+            git commit -m "chore: update seen_issues.json [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }}
+            git push origin ${{ github.ref_name }}
+            echo "State successfully pushed to repository."
+          else
+            echo "No state changes detected. seen_issues.json is already up to date."
+          fi

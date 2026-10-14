@@ -1,0 +1,15 @@
+# Pixi environment directory
+.pixi/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+*.env
+
+# Operating System files
+.DS_Store
+Thumbs.db
