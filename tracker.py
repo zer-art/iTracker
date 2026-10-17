@@ -12,10 +12,11 @@ Environment Variables:
     GMAIL_APP_PASSWORD  : 16-character Google App Password
     EMAIL_RECIPIENT     : Recipient email address (defaults to EMAIL_SENDER if not specified)
     SEEN_ISSUES_FILE    : Path to deduplication JSON file (defaults to "seen_issues.json")
+    HEALTH_FILE         : Path to delivery health state (defaults to "tracker_health.json")
 """
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import json
@@ -67,6 +68,8 @@ DEFAULT_ORGS = ["google",
             "nodejs",
             "linuxfoundation"]
 DEFAULT_SEEN_FILE = "seen_issues.json"
+DEFAULT_HEALTH_FILE = "tracker_health.json"
+NO_EMAIL_ALERT_AFTER_DAYS = 2
 GMAIL_SMTP_HOST = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
 GITHUB_API_BASE = "https://api.github.com"
@@ -77,6 +80,7 @@ class IssueTracker:
         self,
         orgs: List[str],
         seen_file: Path,
+        health_file: Optional[Path] = None,
         github_token: Optional[str] = None,
         email_sender: Optional[str] = None,
         gmail_app_password: Optional[str] = None,
@@ -86,6 +90,7 @@ class IssueTracker:
     ):
         self.orgs = [org.strip() for org in orgs if org.strip()]
         self.seen_file = seen_file
+        self.health_file = health_file or seen_file.with_name(DEFAULT_HEALTH_FILE)
         self.github_token = github_token
         self.email_sender = email_sender
         self.gmail_app_password = gmail_app_password
@@ -94,6 +99,7 @@ class IssueTracker:
         self.limit_per_org = limit_per_org
         self.session = self._create_requests_session()
         self.seen_data: Dict[str, Any] = self._load_seen_issues()
+        self.health_data: Dict[str, Any] = self._load_health_data()
 
     def _create_requests_session(self) -> Any:
         """Create an HTTP session with GitHub API headers and authentication."""
@@ -160,6 +166,102 @@ class IssueTracker:
 
         temp_path.replace(self.seen_file)
         logger.info(f"Saved {len(self.seen_data)} total issues to '{self.seen_file}'.")
+
+    def _load_health_data(self) -> Dict[str, Any]:
+        """Load persistent email delivery counters and monitoring timestamps."""
+        if not self.health_file.exists():
+            now = datetime.now(timezone.utc).isoformat()
+            return {
+                "monitoring_started_at": now,
+                "emails_sent": 0,
+                "last_email_sent_at": None,
+                "alert_sent": False,
+            }
+
+        try:
+            with open(self.health_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("health state must be a JSON object")
+            return {
+                "monitoring_started_at": data.get(
+                    "monitoring_started_at", datetime.now(timezone.utc).isoformat()
+                ),
+                "emails_sent": int(data.get("emails_sent", 0)),
+                "last_email_sent_at": data.get("last_email_sent_at"),
+                "alert_sent": bool(data.get("alert_sent", False)),
+            }
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as e:
+            logger.error(f"Error reading '{self.health_file}': {e}. Resetting health state.")
+            now = datetime.now(timezone.utc).isoformat()
+            return {
+                "monitoring_started_at": now,
+                "emails_sent": 0,
+                "last_email_sent_at": None,
+                "alert_sent": False,
+            }
+
+    def _save_health_data(self) -> None:
+        """Save delivery health state atomically."""
+        if self.dry_run:
+            logger.info("[Dry Run] Skipping write to tracker health state.")
+            return
+
+        self.health_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self.health_file.parent, delete=False, encoding="utf-8"
+        ) as tf:
+            json.dump(self.health_data, tf, indent=2, sort_keys=True)
+            temp_path = Path(tf.name)
+        temp_path.replace(self.health_file)
+
+    def _record_sent_emails(self, count: int) -> None:
+        """Record successfully accepted issue emails and reset the health alert."""
+        if count <= 0:
+            return
+        self.health_data["emails_sent"] += count
+        self.health_data["last_email_sent_at"] = datetime.now(timezone.utc).isoformat()
+        self.health_data["alert_sent"] = False
+        logger.info(
+            "Total issue emails sent: %s; sent in this run: %s.",
+            self.health_data["emails_sent"],
+            count,
+        )
+        self._save_health_data()
+
+    def _send_no_email_health_alert(self) -> None:
+        """Send one alert when no issue email has been sent for two days."""
+        if self.dry_run or self.health_data["alert_sent"]:
+            return
+        if not self.email_sender or not self.gmail_app_password:
+            logger.warning(
+                "No email credentials configured; cannot send the two-day health alert."
+            )
+            return
+
+        reference = self.health_data["last_email_sent_at"] or self.health_data["monitoring_started_at"]
+        try:
+            reference_time = datetime.fromisoformat(reference)
+        except (TypeError, ValueError):
+            logger.error("Invalid health timestamp; skipping the two-day health alert.")
+            return
+
+        elapsed = datetime.now(timezone.utc) - reference_time.astimezone(timezone.utc)
+        if elapsed < timedelta(days=NO_EMAIL_ALERT_AFTER_DAYS):
+            return
+
+        subject = "GitHub Issue Tracker health alert: no emails sent"
+        body = (
+            "The GitHub Issue Tracker has not successfully sent an issue notification "
+            f"email for {elapsed.days} days.\n\n"
+            f"Total issue emails sent so far: {self.health_data['emails_sent']}\n"
+            f"Last successful issue email: {self.health_data['last_email_sent_at'] or 'None'}\n"
+            "Please check the GitHub token, scheduled job, SMTP credentials, and filters."
+        )
+        if self._send_message(subject, body, body):
+            self.health_data["alert_sent"] = True
+            self._save_health_data()
+            logger.warning("Sent two-day no-email health alert.")
 
     def fetch_org_issues(self, org: str) -> List[Dict[str, Any]]:
         """
@@ -378,60 +480,62 @@ class IssueTracker:
 """
         return plain_text, html
 
-    def send_email_alerts(self, new_issues: List[Dict[str, Any]]) -> None:
-        """Send email alerts for each new issue using Gmail SMTP with STARTTLS."""
-        if not new_issues:
-            return
-
-        if self.dry_run:
-            logger.info(f"[Dry Run] Skipping email delivery for {len(new_issues)} new issues.")
-            for issue in new_issues:
-                logger.info(f"[Dry Run Notification] {issue['title']} ({issue['html_url']})")
-            return
-
-        if not self.email_sender or not self.gmail_app_password:
-            logger.warning(
-                "EMAIL_SENDER or GMAIL_APP_PASSWORD is not configured. "
-                "Skipping email delivery. Check your GitHub Secrets!"
-            )
-            return
-
-        logger.info(
-            f"Connecting to Gmail SMTP ({GMAIL_SMTP_HOST}:{GMAIL_SMTP_PORT}) "
-            f"to dispatch {len(new_issues)} notification(s)..."
-        )
-
+    def _send_message(self, subject: str, plain_text: str, html_content: str) -> bool:
+        """Send one email using Gmail SMTP with STARTTLS."""
         try:
-            # Re-use a single authenticated SMTP session to send all alerts efficiently
             with smtplib.SMTP(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
                 server.login(self.email_sender, self.gmail_app_password)
 
-                for issue in new_issues:
-                    subject = f"[{issue['org']}/{issue['repo']}] New Issue: {issue['title']}"
-                    plain_text, html_content = self._build_email_content(issue)
-
-                    msg = MIMEMultipart("alternative")
-                    msg["Subject"] = subject
-                    msg["From"] = f"GitHub Tracker <{self.email_sender}>"
-                    msg["To"] = self.email_recipient
-
-                    # Attach text/plain first, then text/html (standard MIME preference)
-                    msg.attach(MIMEText(plain_text, "plain", "utf-8"))
-                    msg.attach(MIMEText(html_content, "html", "utf-8"))
-
-                    server.send_message(msg)
-                    logger.info(f"Dispatched email alert for issue #{issue['id']} to {self.email_recipient}")
-
-            logger.info("All email alerts sent successfully.")
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = f"GitHub Tracker <{self.email_sender}>"
+                msg["To"] = self.email_recipient
+                msg.attach(MIMEText(plain_text, "plain", "utf-8"))
+                msg.attach(MIMEText(html_content, "html", "utf-8"))
+                server.send_message(msg)
+            return True
         except smtplib.SMTPAuthenticationError as e:
             logger.error(f"Gmail SMTP authentication failed. Please verify your App Password: {e}")
         except smtplib.SMTPException as e:
             logger.error(f"SMTP error while sending email notifications: {e}")
         except Exception as e:
             logger.error(f"Unexpected error sending email notifications: {e}")
+        return False
+
+    def send_email_alerts(self, new_issues: List[Dict[str, Any]]) -> int:
+        """Send email alerts for each new issue and return the successful count."""
+        if not new_issues:
+            return 0
+
+        if self.dry_run:
+            logger.info(f"[Dry Run] Skipping email delivery for {len(new_issues)} new issues.")
+            for issue in new_issues:
+                logger.info(f"[Dry Run Notification] {issue['title']} ({issue['html_url']})")
+            return 0
+
+        if not self.email_sender or not self.gmail_app_password:
+            logger.warning(
+                "EMAIL_SENDER or GMAIL_APP_PASSWORD is not configured. "
+                "Skipping email delivery. Check your GitHub Secrets!"
+            )
+            return 0
+
+        logger.info(
+            f"Dispatching {len(new_issues)} notification(s) via Gmail SMTP..."
+        )
+
+        sent_count = 0
+        for issue in new_issues:
+            subject = f"[{issue['org']}/{issue['repo']}] New Issue: {issue['title']}"
+            plain_text, html_content = self._build_email_content(issue)
+            if not self._send_message(subject, plain_text, html_content):
+                break
+            sent_count += 1
+            logger.info(f"Dispatched email alert for issue #{issue['id']} to {self.email_recipient}")
+        return sent_count
 
     def run(self) -> None:
         """Main execution flow: fetch -> deduplicate -> alert -> persist."""
@@ -468,11 +572,19 @@ class IssueTracker:
                 f"Found {len(newly_discovered_issues)} new issue(s) across monitored organizations."
             )
             # Dispatch email notifications
-            self.send_email_alerts(newly_discovered_issues)
+            sent_count = self.send_email_alerts(newly_discovered_issues)
+            self._record_sent_emails(sent_count)
             # Persist state
             self._save_seen_issues()
         else:
             logger.info("No new issues found since the previous run. State is up to date.")
+
+        logger.info(
+            "Email counter: %s issue email(s) sent in total.",
+            self.health_data["emails_sent"],
+        )
+        self._send_no_email_health_alert()
+        self._save_health_data()
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +607,12 @@ def parse_arguments() -> argparse.Namespace:
         help=f"Path to seen_issues.json file (default: {DEFAULT_SEEN_FILE})",
     )
     parser.add_argument(
+        "--health-file",
+        type=str,
+        default=os.environ.get("HEALTH_FILE", DEFAULT_HEALTH_FILE),
+        help=f"Path to delivery health state (default: {DEFAULT_HEALTH_FILE})",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=20,
@@ -515,6 +633,7 @@ def main():
     tracker = IssueTracker(
         orgs=org_list,
         seen_file=Path(args.file),
+        health_file=Path(args.health_file),
         github_token=os.environ.get("GITHUB_TOKEN"),
         email_sender=os.environ.get("EMAIL_SENDER"),
         gmail_app_password=os.environ.get("GMAIL_APP_PASSWORD"),
