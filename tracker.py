@@ -50,7 +50,22 @@ logger = logging.getLogger("IssueTracker")
 # ---------------------------------------------------------------------------
 # Constants & Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_ORGS = ["google", "pallets"]
+DEFAULT_ORGS = ["google",
+            "pallets",
+            "cBioPortal",
+            "google-deepmind",
+            "kornia",
+            "openclimatefix",
+            "huggingface",
+            "pytorch",
+            "kubeflow",
+            "freecodecamp",
+            "cncf",
+            "kubernetes",
+            "KDE",
+            "apache",
+            "nodejs",
+            "linuxfoundation"]
 DEFAULT_SEEN_FILE = "seen_issues.json"
 GMAIL_SMTP_HOST = "smtp.gmail.com"
 GMAIL_SMTP_PORT = 587
@@ -92,8 +107,8 @@ class IssueTracker:
                 }
             )
             if self.github_token:
-                session.headers.update({"Authorization": f"Bearer {self.github_token}"})
-                logger.info("GitHub API authentication enabled (using Bearer token).")
+                session.headers.update({"Authorization": "Bearer " + self.github_token})
+                logger.info("GitHub API authentication enabled.")
             else:
                 logger.warning(
                     "GITHUB_TOKEN is not set. Requests are unauthenticated and subject to strict rate limits."
@@ -190,7 +205,7 @@ class IssueTracker:
             req.add_header("X-GitHub-Api-Version", "2022-11-28")
             req.add_header("User-Agent", "Serverless-GitHub-Issue-Tracker/1.0")
             if self.github_token:
-                req.add_header("Authorization", f"Bearer {self.github_token}")
+                req.add_header("Authorization", "Bearer " + self.github_token)
 
             try:
                 with urllib.request.urlopen(req, timeout=15) as resp:
